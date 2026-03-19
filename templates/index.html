@@ -3,7 +3,7 @@
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Mistral Chat</title>
+    <title>NetBox Chat</title>
     <style>
         * {
             margin: 0;
@@ -85,6 +85,32 @@
             border-bottom-left-radius: 4px;
         }
 
+        .tool-status {
+            align-self: flex-start;
+            padding: 6px 14px;
+            border-radius: 8px;
+            font-size: 13px;
+            color: #4fc3f7;
+            background: #0d1b2a;
+            border: 1px solid #1a3a5c;
+            display: flex;
+            align-items: center;
+            gap: 8px;
+        }
+
+        .tool-status .spinner {
+            width: 14px;
+            height: 14px;
+            border: 2px solid #4fc3f7;
+            border-top-color: transparent;
+            border-radius: 50%;
+            animation: spin 0.8s linear infinite;
+        }
+
+        @keyframes spin {
+            to { transform: rotate(360deg); }
+        }
+
         #input-area {
             display: flex;
             gap: 10px;
@@ -145,7 +171,7 @@
 </head>
 <body>
     <header>
-        <h1>Mistral Chat</h1>
+        <h1>NetBox Chat</h1>
         <button id="new-chat-btn">New Chat</button>
     </header>
 
@@ -182,6 +208,16 @@
             return div;
         }
 
+        function addToolStatus(content) {
+            if (emptyState) emptyState.remove();
+            const div = document.createElement("div");
+            div.className = "tool-status";
+            div.innerHTML = `<span class="spinner"></span><span>${content}</span>`;
+            chatContainer.appendChild(div);
+            scrollToBottom();
+            return div;
+        }
+
         async function sendMessage() {
             const text = messageInput.value.trim();
             if (!text || sending) return;
@@ -192,7 +228,8 @@
             messageInput.style.height = "auto";
 
             addMessage("user", text);
-            const assistantDiv = addMessage("assistant", "");
+            let assistantDiv = null;
+            let statusDiv = null;
 
             try {
                 const response = await fetch("/chat", {
@@ -223,23 +260,46 @@
                         try {
                             const data = JSON.parse(payload);
                             if (data.error) {
+                                if (!assistantDiv) assistantDiv = addMessage("assistant", "");
                                 assistantDiv.textContent = `Error: ${data.error}`;
                                 break;
                             }
-                            fullResponse += data.token;
-                            assistantDiv.textContent = fullResponse;
-                            scrollToBottom();
+                            if (data.type === "status") {
+                                // Remove previous status indicator if any
+                                if (statusDiv) statusDiv.remove();
+                                statusDiv = addToolStatus(data.content);
+                            } else if (data.type === "token") {
+                                // Remove status indicator once tokens start flowing
+                                if (statusDiv) {
+                                    statusDiv.remove();
+                                    statusDiv = null;
+                                }
+                                if (!assistantDiv) assistantDiv = addMessage("assistant", "");
+                                fullResponse += data.token;
+                                assistantDiv.textContent = fullResponse;
+                                scrollToBottom();
+                            } else if (data.token) {
+                                // Backwards-compatible: handle plain {token} payloads
+                                if (!assistantDiv) assistantDiv = addMessage("assistant", "");
+                                fullResponse += data.token;
+                                assistantDiv.textContent = fullResponse;
+                                scrollToBottom();
+                            }
                         } catch (e) {
                             // skip malformed JSON
                         }
                     }
                 }
 
+                // Clean up any leftover status indicator
+                if (statusDiv) statusDiv.remove();
+
                 if (fullResponse) {
                     history.push({ role: "user", content: text });
                     history.push({ role: "assistant", content: fullResponse });
                 }
             } catch (err) {
+                if (!assistantDiv) assistantDiv = addMessage("assistant", "");
                 assistantDiv.textContent = `Connection error: ${err.message}`;
             }
 

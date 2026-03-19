@@ -16,6 +16,9 @@ build/
 .DS_Store
 Thumbs.db
 
+# Cloned dependencies
+netbox-mcp-server/
+
 # IDE
 .vscode/
 .idea/
