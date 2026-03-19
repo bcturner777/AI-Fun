@@ -26,7 +26,7 @@ cd netbox-mcp-server && uv sync && cd ..
 # Create Python venv and install dependencies
 python3.10 -m venv venv
 source venv/bin/activate
-pip install flask ollama python-dotenv "mcp[cli]"
+pip install -r requirements.txt
 ```
 
 ### Environment Variables
