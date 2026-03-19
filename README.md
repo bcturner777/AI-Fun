@@ -77,7 +77,7 @@ An interactive terminal chat.
 ## Features
 
 - Chat with Llama 3.1 via a browser-based UI with real-time streaming (SSE)
-- Query NetBox infrastructure data through natural language (devices, IPs, sites, VLANs, etc.)
+- Query NetBox infrastructure data through natural language (devices, IPs, sites, VLANs, etc.) — read-only operations only; creating, updating, or deleting objects is not supported
 - MCP tool integration with automatic tool discovery from the NetBox MCP server
 - Visual status indicators in the UI while tools execute ("Calling netbox_get_objects...")
 - Argument fixup layer that coerces the 8B model's common mistakes (type mismatches, missing prefixes, limit clamping)
