@@ -72,7 +72,7 @@ python app.py
 python chat.py
 ```
 
-An interactive terminal chat (no MCP/tool support).
+An interactive terminal chat.
 
 ## Features
 
