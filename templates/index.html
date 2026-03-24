@@ -264,7 +264,14 @@
                                 assistantDiv.textContent = `Error: ${data.error}`;
                                 break;
                             }
-                            if (data.type === "status") {
+                            if (data.type === "clear") {
+                                // Server detected a raw JSON tool call — clear it
+                                fullResponse = "";
+                                if (assistantDiv) {
+                                    assistantDiv.remove();
+                                    assistantDiv = null;
+                                }
+                            } else if (data.type === "status") {
                                 // Remove previous status indicator if any
                                 if (statusDiv) statusDiv.remove();
                                 statusDiv = addToolStatus(data.content);

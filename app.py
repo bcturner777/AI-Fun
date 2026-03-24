@@ -20,7 +20,7 @@ SYSTEM_PROMPT = (
     "When the user asks about network infrastructure, call the appropriate tool, wait for "
     "the result, and then present the returned data in a clear summary. "
     "Never explain how to use the API. Never write code. Never make up data. "
-    "object_type must use dotted format like 'dcim.device', 'ipam.ipaddress', 'dcim.site'. "
+    "object_type must use dotted format like 'dcim.device', 'ipam.ipaddress', 'dcim.site', 'extras.tag'. "
     "filters must be a JSON object like {} or {\"status\": \"active\"}."
 )
 
@@ -166,10 +166,11 @@ def fixup_tool_args(name, args):
 
     # --- Semantic fixes ---
 
-    # Fix object_type missing app prefix (e.g. "device" → "dcim.device")
+    # Fix object_type — correct wrong or missing app prefix
     ot = args.get("object_type", "")
-    if ot and "." not in ot:
-        prefix_map = {
+    if ot:
+        # Map short names to correct dotted type
+        short_map = {
             "device": "dcim.device", "site": "dcim.site", "rack": "dcim.rack",
             "interface": "dcim.interface", "cable": "dcim.cable",
             "manufacturer": "dcim.manufacturer", "platform": "dcim.platform",
@@ -179,8 +180,28 @@ def fixup_tool_args(name, args):
             "cluster": "virtualization.cluster",
             "circuit": "circuits.circuit", "provider": "circuits.provider",
             "tenant": "tenancy.tenant",
+            "tag": "extras.tag", "webhook": "extras.webhook",
+            "customfield": "extras.customfield",
+            "journalentry": "extras.journalentry",
         }
-        args["object_type"] = prefix_map.get(ot.lower(), f"dcim.{ot.lower()}")
+        # Map wrongly-prefixed types to correct ones (model often puts
+        # extras types under dcim/ipam)
+        correction_map = {
+            "dcim.tag": "extras.tag", "ipam.tag": "extras.tag",
+            "dcim.webhook": "extras.webhook", "ipam.webhook": "extras.webhook",
+            "dcim.customfield": "extras.customfield",
+            "dcim.journalentry": "extras.journalentry",
+            "dcim.virtualmachine": "virtualization.virtualmachine",
+            "ipam.device": "dcim.device", "ipam.site": "dcim.site",
+            "ipam.interface": "dcim.interface", "ipam.rack": "dcim.rack",
+            "dcim.ipaddress": "ipam.ipaddress", "dcim.vlan": "ipam.vlan",
+            "dcim.prefix": "ipam.prefix", "dcim.vrf": "ipam.vrf",
+        }
+        ot_lower = ot.lower()
+        if ot_lower in correction_map:
+            args["object_type"] = correction_map[ot_lower]
+        elif "." not in ot:
+            args["object_type"] = short_map.get(ot_lower, f"dcim.{ot_lower}")
 
     # Strip None-valued keys (model sometimes sends ordering=None)
     args = {k: v for k, v in args.items() if v is not None}
@@ -200,6 +221,28 @@ async def execute_tool(name, arguments):
                 if hasattr(content, "text"):
                     texts.append(content.text)
             return "\n".join(texts) if texts else str(result)
+
+
+def parse_text_tool_call(text):
+    """Detect and parse a raw JSON tool call emitted as text.
+
+    Llama 3.1 8B sometimes outputs a tool call as plain text instead of
+    using native tool_calls. If the text looks like {"name": ..., "parameters": ...},
+    parse it and return (tool_name, tool_args) so we can execute it anyway.
+    Returns None if the text isn't a tool call.
+    """
+    text = text.strip()
+    if not (text.startswith("{") and text.endswith("}")):
+        return None
+    try:
+        # Normalize Python-style bools/None for JSON parsing
+        normalized = text.replace("False", "false").replace("True", "true").replace("None", "null")
+        obj = json.loads(normalized)
+        if "name" in obj and "parameters" in obj:
+            return obj["name"], obj["parameters"]
+    except (json.JSONDecodeError, TypeError):
+        pass
+    return None
 
 
 @app.route("/")
@@ -242,6 +285,17 @@ def chat():
                     yield f"data: {json.dumps({'type': 'token', 'token': token})}\n\n"
                 if msg.get("tool_calls"):
                     tool_calls.extend(msg["tool_calls"])
+
+            # Fallback: if the model emitted a raw JSON tool call as text,
+            # parse it and treat it as a real tool call
+            if not tool_calls and full_content:
+                parsed = parse_text_tool_call(full_content)
+                if parsed:
+                    tool_name, tool_args = parsed
+                    tool_calls = [{"function": {"name": tool_name, "arguments": tool_args}}]
+                    # Clear the streamed text — it was a tool call, not a response
+                    full_content = ""
+                    yield f"data: {json.dumps({'type': 'clear'})}\n\n"
 
             if tool_calls:
                 # Add assistant message with tool calls to history
