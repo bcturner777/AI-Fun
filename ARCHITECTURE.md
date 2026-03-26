@@ -60,7 +60,7 @@ The orchestration layer that bridges Claude, MCP servers, and the browser. This 
 
 ### Anthropic API (Claude)
 
-The LLM backend. The app uses Claude Sonnet 4.5 via the Anthropic API with native tool-calling support.
+The LLM backend. The app uses Claude Haiku 4.5 via the Anthropic API with native tool-calling support.
 
 - Receives messages + tool definitions from Flask (unified list from all MCP servers)
 - Decides autonomously whether to respond directly or invoke a tool
