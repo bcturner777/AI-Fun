@@ -1,6 +1,6 @@
 # AI-Fun
 
-A local AI chat app powered by [Claude](https://www.anthropic.com/) (Anthropic API), with [NetBox](https://netboxlabs.com/) and [Cisco Meraki](https://meraki.cisco.com/) integration via the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/). Ask questions about your network infrastructure directly in the chat and get live answers from your NetBox inventory and Meraki dashboard.
+A local AI chat app powered by [Claude Haiku 4.5](https://www.anthropic.com/) (Anthropic API), with [NetBox](https://netboxlabs.com/) and [Cisco Meraki](https://meraki.cisco.com/) integration via the [Model Context Protocol (MCP)](https://modelcontextprotocol.io/). Ask questions about your network infrastructure directly in the chat and get live answers from your NetBox inventory and Meraki dashboard.
 
 ## Prerequisites
 
@@ -89,7 +89,7 @@ An interactive terminal chat (uses Ollama/Mistral separately — not part of the
 
 ## Features
 
-- Chat with Claude via a browser-based UI with real-time streaming (SSE)
+- Chat with Claude Haiku 4.5 via a browser-based UI with real-time streaming (SSE)
 - Query NetBox infrastructure data through natural language (devices, IPs, sites, VLANs, etc.) — read-only operations only; creating, updating, or deleting objects is not supported
 - Query Cisco Meraki dashboard data through natural language (networks, devices, SSIDs, clients, etc.)
 - Multi-server MCP integration with automatic tool discovery from both NetBox and Meraki MCP servers
