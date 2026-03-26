@@ -18,6 +18,7 @@ Thumbs.db
 
 # Cloned dependencies
 netbox-mcp-server/
+meraki-mcp-server/
 
 # IDE
 .vscode/

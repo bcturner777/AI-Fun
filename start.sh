@@ -16,15 +16,28 @@ if [ -z "$NETBOX_URL" ] || [ -z "$NETBOX_TOKEN" ]; then
     exit 1
 fi
 
-MCP_PID=""
+if [ -z "$MERAKI_API_KEY" ] || [ -z "$MERAKI_ORG_ID" ]; then
+    echo "Error: MERAKI_API_KEY and MERAKI_ORG_ID must be set in .env or environment"
+    exit 1
+fi
+
+if [ -z "$ANTHROPIC_API_KEY" ]; then
+    echo "Error: ANTHROPIC_API_KEY must be set in .env or environment"
+    exit 1
+fi
+
+NETBOX_MCP_PID=""
+MERAKI_MCP_PID=""
 
 cleanup() {
     echo ""
     echo "Shutting down..."
-    if [ -n "$MCP_PID" ] && kill -0 "$MCP_PID" 2>/dev/null; then
-        kill "$MCP_PID"
-        wait "$MCP_PID" 2>/dev/null
-    fi
+    for pid in "$NETBOX_MCP_PID" "$MERAKI_MCP_PID"; do
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            kill "$pid"
+            wait "$pid" 2>/dev/null
+        fi
+    done
     exit 0
 }
 
@@ -34,28 +47,39 @@ trap cleanup INT TERM
 echo "Starting NetBox MCP server on http://127.0.0.1:8000/mcp ..."
 TRANSPORT=http HOST=127.0.0.1 PORT=8000 \
     uv --directory "$SCRIPT_DIR/netbox-mcp-server" run netbox-mcp-server &
-MCP_PID=$!
+NETBOX_MCP_PID=$!
 
-# Wait for MCP server to accept TCP connections
-echo "Waiting for MCP server..."
-MCP_READY=false
-for i in $(seq 1 30); do
-    if ! kill -0 "$MCP_PID" 2>/dev/null; then
-        echo "Error: MCP server process exited."
-        exit 1
-    fi
-    # Check if port 8000 is accepting connections (works regardless of HTTP method)
-    if nc -z 127.0.0.1 8000 2>/dev/null; then
-        echo "MCP server is ready."
-        MCP_READY=true
-        break
-    fi
-    sleep 1
-done
+# Start Meraki MCP server in background (HTTP transport on port 8001)
+echo "Starting Meraki MCP server on http://127.0.0.1:8001/mcp ..."
+MCP_TRANSPORT=http MCP_HOST=127.0.0.1 MCP_PORT=8001 \
+    uv --directory "$SCRIPT_DIR/meraki-mcp-server" run python meraki-mcp-dynamic.py &
+MERAKI_MCP_PID=$!
 
-if [ "$MCP_READY" = false ]; then
-    echo "Warning: MCP server did not become ready in 30s, starting Flask anyway."
-fi
+# Wait for both MCP servers to accept TCP connections
+wait_for_server() {
+    local name="$1" port="$2" pid="$3"
+    echo "Waiting for $name MCP server (port $port)..."
+    local ready=false
+    for i in $(seq 1 30); do
+        if ! kill -0 "$pid" 2>/dev/null; then
+            echo "Error: $name MCP server process exited."
+            return 1
+        fi
+        if nc -z 127.0.0.1 "$port" 2>/dev/null; then
+            echo "$name MCP server is ready."
+            ready=true
+            break
+        fi
+        sleep 1
+    done
+    if [ "$ready" = false ]; then
+        echo "Warning: $name MCP server did not become ready in 30s, continuing anyway."
+    fi
+    return 0
+}
+
+wait_for_server "NetBox" 8000 "$NETBOX_MCP_PID"
+wait_for_server "Meraki" 8001 "$MERAKI_MCP_PID"
 
 # Start Flask app
 echo "Starting Flask app on http://localhost:5001 ..."

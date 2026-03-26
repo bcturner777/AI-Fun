@@ -2,7 +2,7 @@ import asyncio
 import json
 import os
 
-import ollama
+import anthropic
 from dotenv import load_dotenv
 from flask import Flask, Response, render_template, request
 from mcp.client.session import ClientSession
@@ -12,113 +12,89 @@ load_dotenv()
 
 app = Flask(__name__)
 
-MODEL = "llama3.1"
-MCP_URL = os.getenv("MCP_URL", "http://127.0.0.1:8000/mcp")
+MODEL = "claude-haiku-4-5-20251001"
+MAX_TOKENS = 4096
+MCP_SERVERS = [
+    {"name": "NetBox", "url": os.getenv("MCP_URL_NETBOX", "http://127.0.0.1:8000/mcp")},
+    {"name": "Meraki", "url": os.getenv("MCP_URL_MERAKI", "http://127.0.0.1:8001/mcp")},
+]
+
+client = anthropic.Anthropic()
 
 SYSTEM_PROMPT = (
-    "You are a helpful network assistant. You have tools that query a live NetBox system. "
-    "When the user asks about network infrastructure, call the appropriate tool, wait for "
-    "the result, and then present the returned data in a clear summary. "
+    "You are a helpful network assistant. You have tools that query live NetBox and "
+    "Cisco Meraki systems. When the user asks about network infrastructure, call the "
+    "appropriate tool, wait for the result, and then present the returned data in a clear summary. "
     "Never explain how to use the API. Never write code. Never make up data. "
+    "If a tool returns an error, tell the user what went wrong — do NOT guess or fabricate results. "
+    "\n\n"
+    "NetBox tools (netbox_*): "
     "object_type must use dotted format like 'dcim.device', 'ipam.ipaddress', 'dcim.site', 'extras.tag'. "
-    "filters must be a JSON object like {} or {\"status\": \"active\"}."
+    "filters must be a JSON object like {} or {\"status\": \"active\"}. "
+    "To find resources by tag, use the filter {\"tag\": \"tag-slug\"} (e.g. {\"tag\": \"production\"}). "
+    "Do NOT use 'tagged_objects__id' or other multi-hop filters. "
+    "\n\n"
+    "Meraki tools: "
+    "Use the dedicated Meraki tools to query Cisco Meraki. Common tools include: "
+    "getOrganizations, getOrganizationNetworks, getOrganizationDevices, "
+    "getNetworkClients (requires networkId), getNetworkDevices (requires networkId), "
+    "getNetworkWirelessSsids (requires networkId), getDeviceSwitchPorts (requires serial). "
+    "For any endpoint not covered by a dedicated tool, use call_meraki_api with a section, method, and parameters. "
+    "When a tool requires a networkId, first call getOrganizationNetworks to get the list of networks."
 )
 
-# Global store for MCP tools in Ollama format
-ollama_tools = []
+# Global store for MCP tools in Anthropic format
+anthropic_tools = []
 mcp_tool_names = {}
+tool_server_map = {}  # tool_name -> server_url for routing execution
 tools_discovered = False
 
 
 def ensure_tools():
     """Discover MCP tools if not already done. Safe to call repeatedly."""
-    global ollama_tools, mcp_tool_names, tools_discovered
+    global anthropic_tools, mcp_tool_names, tool_server_map, tools_discovered
     if tools_discovered:
         return
     try:
-        ollama_tools, mcp_tool_names = asyncio.run(discover_tools())
+        anthropic_tools, mcp_tool_names, tool_server_map = asyncio.run(discover_tools())
         tools_discovered = True
-        print(f"Discovered {len(ollama_tools)} MCP tools: {list(mcp_tool_names.keys())}")
+        print(f"Discovered {len(anthropic_tools)} MCP tools: {list(mcp_tool_names.keys())}")
     except Exception as e:
-        print(f"Warning: Could not connect to MCP server: {e}")
-
-
-ALLOWED_SCHEMA_KEYS = {"type", "description", "properties", "required", "items", "enum"}
-
-
-def simplify_schema(schema):
-    """Simplify a JSON Schema for Ollama compatibility.
-
-    Ollama's tool parser chokes on anyOf, additionalProperties, default,
-    minimum/maximum, and other advanced JSON Schema features. Keep only
-    the core keys that Ollama understands.
-    """
-    if not isinstance(schema, dict):
-        return schema
-
-    result = {}
-
-    # Resolve anyOf: pick the first non-null type
-    if "anyOf" in schema:
-        for option in schema["anyOf"]:
-            if option.get("type") != "null":
-                result.update(simplify_schema(option))
-                break
-        if "description" in schema:
-            result["description"] = schema["description"]
-        return result
-
-    for key, value in schema.items():
-        if key not in ALLOWED_SCHEMA_KEYS:
-            continue
-        if key == "properties" and isinstance(value, dict):
-            result[key] = {k: simplify_schema(v) for k, v in value.items()}
-        elif key == "items" and isinstance(value, dict):
-            result[key] = simplify_schema(value)
-        else:
-            result[key] = value
-
-    return result
-
-
-def condense_description(description):
-    """Condense a tool description to its first paragraph.
-
-    Llama 3.1 8B's tool-calling breaks when descriptions are too long
-    (thousands of chars with embedded docs). Keep just the summary.
-    """
-    if not description:
-        return ""
-    return description.strip().split("\n\n")[0].strip()
+        print(f"Warning: Could not connect to MCP servers: {e}")
 
 
 async def discover_tools():
-    """Connect to MCP server and discover available tools."""
-    async with streamable_http_client(MCP_URL) as (read, write, _):
-        async with ClientSession(read, write) as session:
-            await session.initialize()
-            result = await session.list_tools()
-            tools = []
-            names = {}
-            for tool in result.tools:
-                tools.append({
-                    "type": "function",
-                    "function": {
-                        "name": tool.name,
-                        "description": condense_description(tool.description),
-                        "parameters": simplify_schema(tool.inputSchema),
-                    },
-                })
-                names[tool.name] = tool.description or tool.name
-            return tools, names
+    """Connect to all MCP servers and discover available tools."""
+    tools = []
+    names = {}
+    server_map = {}
+    for server in MCP_SERVERS:
+        try:
+            async with streamable_http_client(server["url"]) as (read, write, _):
+                async with ClientSession(read, write) as session:
+                    await session.initialize()
+                    result = await session.list_tools()
+                    for tool in result.tools:
+                        tools.append({
+                            "name": tool.name,
+                            "description": tool.description or "",
+                            "input_schema": tool.inputSchema,
+                        })
+                        names[tool.name] = tool.description or tool.name
+                        server_map[tool.name] = server["url"]
+                    print(f"  {server['name']}: discovered {len(result.tools)} tools")
+        except Exception as e:
+            print(f"  Warning: Could not connect to {server['name']} MCP server at {server['url']}: {e}")
+    return tools, names, server_map
 
 
 def fixup_tool_args(name, args):
-    """Fix common argument mistakes from small models.
+    """Fix common argument mistakes from models.
 
-    Llama 3.1 8B frequently serializes dicts/lists as strings, passes
-    wrong types for ints/bools, omits dotted prefixes on object_type,
-    and exceeds limits. Coerce everything before sending to MCP.
+    Coerces dicts/lists passed as strings, fixes wrong types for
+    ints/bools, corrects dotted prefixes on object_type, and clamps
+    limits. Defense-in-depth — unlikely to trigger with Claude but
+    the NetBox-specific semantic fixes correct domain knowledge gaps.
     """
     args = dict(args)
 
@@ -164,44 +140,63 @@ def fixup_tool_args(name, args):
     if "limit" in args and isinstance(args["limit"], int):
         args["limit"] = max(1, min(args["limit"], 100))
 
-    # --- Semantic fixes ---
+    # --- NetBox-specific semantic fixes ---
+    # Only apply these when the tool belongs to NetBox
+    if name.startswith("netbox_"):
+        # Fix object_type — correct wrong or missing app prefix
+        ot = args.get("object_type", "")
+        if ot:
+            # Map short names to correct dotted type
+            short_map = {
+                "device": "dcim.device", "site": "dcim.site", "rack": "dcim.rack",
+                "interface": "dcim.interface", "cable": "dcim.cable",
+                "manufacturer": "dcim.manufacturer", "platform": "dcim.platform",
+                "ipaddress": "ipam.ipaddress", "prefix": "ipam.prefix",
+                "vlan": "ipam.vlan", "vrf": "ipam.vrf",
+                "virtualmachine": "virtualization.virtualmachine",
+                "cluster": "virtualization.cluster",
+                "circuit": "circuits.circuit", "provider": "circuits.provider",
+                "tenant": "tenancy.tenant",
+                "tag": "extras.tag", "webhook": "extras.webhook",
+                "customfield": "extras.customfield",
+                "journalentry": "extras.journalentry",
+            }
+            # Map wrongly-prefixed types to correct ones (model often puts
+            # extras types under dcim/ipam)
+            correction_map = {
+                "dcim.tag": "extras.tag", "ipam.tag": "extras.tag",
+                "dcim.webhook": "extras.webhook", "ipam.webhook": "extras.webhook",
+                "dcim.customfield": "extras.customfield",
+                "dcim.journalentry": "extras.journalentry",
+                "dcim.virtualmachine": "virtualization.virtualmachine",
+                "ipam.device": "dcim.device", "ipam.site": "dcim.site",
+                "ipam.interface": "dcim.interface", "ipam.rack": "dcim.rack",
+                "dcim.ipaddress": "ipam.ipaddress", "dcim.vlan": "ipam.vlan",
+                "dcim.prefix": "ipam.prefix", "dcim.vrf": "ipam.vrf",
+            }
+            ot_lower = ot.lower()
+            if ot_lower in correction_map:
+                args["object_type"] = correction_map[ot_lower]
+            elif "." not in ot:
+                args["object_type"] = short_map.get(ot_lower, f"dcim.{ot_lower}")
 
-    # Fix object_type — correct wrong or missing app prefix
-    ot = args.get("object_type", "")
-    if ot:
-        # Map short names to correct dotted type
-        short_map = {
-            "device": "dcim.device", "site": "dcim.site", "rack": "dcim.rack",
-            "interface": "dcim.interface", "cable": "dcim.cable",
-            "manufacturer": "dcim.manufacturer", "platform": "dcim.platform",
-            "ipaddress": "ipam.ipaddress", "prefix": "ipam.prefix",
-            "vlan": "ipam.vlan", "vrf": "ipam.vrf",
-            "virtualmachine": "virtualization.virtualmachine",
-            "cluster": "virtualization.cluster",
-            "circuit": "circuits.circuit", "provider": "circuits.provider",
-            "tenant": "tenancy.tenant",
-            "tag": "extras.tag", "webhook": "extras.webhook",
-            "customfield": "extras.customfield",
-            "journalentry": "extras.journalentry",
-        }
-        # Map wrongly-prefixed types to correct ones (model often puts
-        # extras types under dcim/ipam)
-        correction_map = {
-            "dcim.tag": "extras.tag", "ipam.tag": "extras.tag",
-            "dcim.webhook": "extras.webhook", "ipam.webhook": "extras.webhook",
-            "dcim.customfield": "extras.customfield",
-            "dcim.journalentry": "extras.journalentry",
-            "dcim.virtualmachine": "virtualization.virtualmachine",
-            "ipam.device": "dcim.device", "ipam.site": "dcim.site",
-            "ipam.interface": "dcim.interface", "ipam.rack": "dcim.rack",
-            "dcim.ipaddress": "ipam.ipaddress", "dcim.vlan": "ipam.vlan",
-            "dcim.prefix": "ipam.prefix", "dcim.vrf": "ipam.vrf",
-        }
-        ot_lower = ot.lower()
-        if ot_lower in correction_map:
-            args["object_type"] = correction_map[ot_lower]
-        elif "." not in ot:
-            args["object_type"] = short_map.get(ot_lower, f"dcim.{ot_lower}")
+        # Fix common filter key mistakes from the model
+        if "filters" in args and isinstance(args["filters"], dict):
+            filters = args["filters"]
+            # Model uses multi-hop filters that NetBox MCP rejects;
+            # rewrite to the correct single-key filter
+            filter_rewrites = {
+                "tagged_objects__id": "tag",
+                "tagged_objects__name": "tag",
+                "tags__name": "tag",
+                "tags__id": "tag",
+                "tags__slug": "tag",
+            }
+            rewritten = {}
+            for k, v in filters.items():
+                new_key = filter_rewrites.get(k, k)
+                rewritten[new_key] = v
+            args["filters"] = rewritten
 
     # Strip None-valued keys (model sometimes sends ordering=None)
     args = {k: v for k, v in args.items() if v is not None}
@@ -212,7 +207,10 @@ def fixup_tool_args(name, args):
 async def execute_tool(name, arguments):
     """Execute a tool via MCP and return the text result."""
     arguments = fixup_tool_args(name, arguments)
-    async with streamable_http_client(MCP_URL) as (read, write, _):
+    server_url = tool_server_map.get(name)
+    if not server_url:
+        return f"Error: unknown tool '{name}' — not found on any MCP server"
+    async with streamable_http_client(server_url) as (read, write, _):
         async with ClientSession(read, write) as session:
             await session.initialize()
             result = await session.call_tool(name, arguments)
@@ -226,8 +224,8 @@ async def execute_tool(name, arguments):
 def parse_text_tool_call(text):
     """Detect and parse a raw JSON tool call emitted as text.
 
-    Llama 3.1 8B sometimes outputs a tool call as plain text instead of
-    using native tool_calls. If the text looks like {"name": ..., "parameters": ...},
+    Safety net — unlikely to trigger with Claude but harmless to keep.
+    If the text looks like {"name": ..., "parameters": ...},
     parse it and return (tool_name, tool_args) so we can execute it anyway.
     Returns None if the text isn't a tool call.
     """
@@ -261,73 +259,105 @@ def chat():
 
     history.append({"role": "user", "content": user_message})
 
-    # Prepend system prompt for Ollama calls
-    messages = [{"role": "system", "content": SYSTEM_PROMPT}] + history
+    messages = list(history)
 
     def generate():
         try:
             # Stream first response (may include tool calls)
-            stream = ollama.chat(
+            with client.messages.stream(
                 model=MODEL,
+                max_tokens=MAX_TOKENS,
+                system=SYSTEM_PROMPT,
                 messages=messages,
-                tools=ollama_tools or None,
-                stream=True,
-            )
+                tools=anthropic_tools or [],
+            ) as stream:
+                for text in stream.text_stream:
+                    yield f"data: {json.dumps({'type': 'token', 'token': text})}\n\n"
+                response = stream.get_final_message()
 
-            full_content = ""
-            tool_calls = []
-
-            for chunk in stream:
-                msg = chunk["message"]
-                if msg.get("content"):
-                    token = msg["content"]
-                    full_content += token
-                    yield f"data: {json.dumps({'type': 'token', 'token': token})}\n\n"
-                if msg.get("tool_calls"):
-                    tool_calls.extend(msg["tool_calls"])
+            # Check for tool use
+            tool_use_blocks = [
+                block for block in response.content
+                if block.type == "tool_use"
+            ]
 
             # Fallback: if the model emitted a raw JSON tool call as text,
             # parse it and treat it as a real tool call
-            if not tool_calls and full_content:
-                parsed = parse_text_tool_call(full_content)
+            if not tool_use_blocks:
+                full_text = "".join(
+                    block.text for block in response.content if block.type == "text"
+                )
+                parsed = parse_text_tool_call(full_text)
                 if parsed:
                     tool_name, tool_args = parsed
-                    tool_calls = [{"function": {"name": tool_name, "arguments": tool_args}}]
                     # Clear the streamed text — it was a tool call, not a response
-                    full_content = ""
                     yield f"data: {json.dumps({'type': 'clear'})}\n\n"
 
-            if tool_calls:
-                # Add assistant message with tool calls to history
-                messages.append({
-                    "role": "assistant",
-                    "content": full_content,
-                    "tool_calls": tool_calls,
-                })
+                    yield f"data: {json.dumps({'type': 'status', 'content': f'Calling {tool_name}...'})}\n\n"
+                    try:
+                        result = asyncio.run(execute_tool(tool_name, tool_args))
+                        if result.startswith("Error"):
+                            result = f"TOOL ERROR — do NOT make up data. Report this error to the user: {result}"
+                    except Exception as e:
+                        result = f"TOOL ERROR — do NOT make up data. Report this error to the user: {e}"
 
-                for tc in tool_calls:
-                    fn = tc["function"]
-                    tool_name = fn["name"]
-                    tool_args = fn.get("arguments", {})
+                    messages.append({"role": "assistant", "content": full_text})
+                    messages.append({"role": "user", "content": result})
+
+                    # Second call with tool result — stream final answer
+                    with client.messages.stream(
+                        model=MODEL,
+                        max_tokens=MAX_TOKENS,
+                        system=SYSTEM_PROMPT,
+                        messages=messages,
+                        tools=anthropic_tools or [],
+                    ) as stream2:
+                        for text in stream2.text_stream:
+                            yield f"data: {json.dumps({'type': 'token', 'token': text})}\n\n"
+
+            if tool_use_blocks:
+                # Add assistant's full response (text + tool_use blocks)
+                messages.append({"role": "assistant", "content": response.content})
+
+                # Execute each tool and collect results
+                tool_results = []
+                for block in tool_use_blocks:
+                    tool_name = block.name
+                    tool_args = block.input
 
                     yield f"data: {json.dumps({'type': 'status', 'content': f'Calling {tool_name}...'})}\n\n"
 
                     try:
                         result = asyncio.run(execute_tool(tool_name, tool_args))
+                        if result.startswith("Error"):
+                            result = f"TOOL ERROR — do NOT make up data. Report this error to the user: {result}"
                     except Exception as e:
-                        result = f"Tool error: {e}"
+                        result = f"TOOL ERROR — do NOT make up data. Report this error to the user: {e}"
 
-                    messages.append({"role": "tool", "content": result})
+                    tool_results.append({
+                        "type": "tool_result",
+                        "tool_use_id": block.id,
+                        "content": result,
+                    })
+
+                # Add tool results as a user message
+                messages.append({"role": "user", "content": tool_results})
 
                 # Second call with tool results — stream final answer
-                stream2 = ollama.chat(model=MODEL, messages=messages, stream=True)
-                for chunk in stream2:
-                    token = chunk["message"].get("content", "")
-                    if token:
-                        yield f"data: {json.dumps({'type': 'token', 'token': token})}\n\n"
+                with client.messages.stream(
+                    model=MODEL,
+                    max_tokens=MAX_TOKENS,
+                    system=SYSTEM_PROMPT,
+                    messages=messages,
+                    tools=anthropic_tools or [],
+                ) as stream2:
+                    for text in stream2.text_stream:
+                        yield f"data: {json.dumps({'type': 'token', 'token': text})}\n\n"
 
             yield "data: [DONE]\n\n"
-        except ollama.ResponseError as e:
+        except anthropic.APIError as e:
+            yield f"data: {json.dumps({'error': str(e)})}\n\n"
+        except Exception as e:
             yield f"data: {json.dumps({'error': str(e)})}\n\n"
 
     return Response(generate(), mimetype="text/event-stream")
